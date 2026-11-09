@@ -1,0 +1,56 @@
+name: build-meet
+
+# 在 GitHub 的免费 runner（4 核 16G）上构建镜像并推到 Docker Hub。
+# 小服务器（2C2G）只负责 docker compose pull，不参与编译。
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: kantouping-meet
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+
+      - name: 拉取上游 meet 源码
+        run: git clone --depth 1 https://github.com/livekit-examples/meet.git src
+
+      - name: 拉取 Git LFS 资源（背景图，不拉会构建失败）
+        run: |
+          cd src
+          git lfs install --local
+          git lfs pull
+
+      - name: 应用补丁 + DeepFilterNet 资源
+        run: bash apply-patches.sh src
+
+      - name: 去掉 .git（--depth 1 也有上百 MB，白传构建上下文）
+        run: rm -rf src/.git
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:r${{ github.run_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
