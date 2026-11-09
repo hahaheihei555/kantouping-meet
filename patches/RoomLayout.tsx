@@ -63,6 +63,17 @@ function collectShares(participants: Participant[]): Sharer[] {
   return out;
 }
 
+/**
+ * 轨道是否「真的还在出画面」。
+ * 坑：停止投屏 / 关掉摄像头之后，旧的 track 对象可能还挂在 publication 上，
+ * videoTrack 不为空但 mediaStreamTrack.readyState 已经是 'ended'，
+ * 这时 <video> 会定格在最后一帧（看起来就是黑屏）。必须靠这个判断挡掉。
+ */
+function isLiveTrack(track: { mediaStreamTrack?: MediaStreamTrack } | null | undefined): boolean {
+  const mst = track?.mediaStreamTrack;
+  return !!mst && mst.readyState === 'live';
+}
+
 function nameOf(p: Participant): string {
   return p.name || p.identity;
 }
@@ -228,6 +239,12 @@ export function RoomLayout() {
       RoomEvent.ParticipantConnected,
       RoomEvent.ParticipantDisconnected,
       RoomEvent.ActiveSpeakersChanged,
+      // 本地开/关投屏、开关摄像头不会触发上面那些 Remote* 事件。
+      // 缺这几个的后果：自己停止共享后 tick 不更新，主舞台残留一个黑框（2026-11-09 修）。
+      RoomEvent.LocalTrackPublished,
+      RoomEvent.LocalTrackUnpublished,
+      RoomEvent.TrackMuted,
+      RoomEvent.TrackUnmuted,
     ];
     events.forEach((e) => room.on(e, bump));
 
@@ -285,8 +302,15 @@ export function RoomLayout() {
   }, [room, watch, tick, wantFor]);
 
   const st = (id: string): WatchState => watch[id] ?? WATCH_OFF;
-  const watched = sharers.filter((s) => st(s.participant.identity).video && s.publication.videoTrack);
-  const unwatched = sharers.filter((s) => !st(s.participant.identity).video);
+  /**
+   * 主舞台要渲染的投屏：我点了接收 + 轨道还活着。
+   * 第 2 条是 2026-11-09 加的：停止共享后旧 track 可能仍挂在 publication 上，
+   * 但 mediaStreamTrack.readyState 已经是 'ended'，<video> 就定格成黑屏。
+   * 注意别顺手加 isMuted 判断：暂停共享时 track 会 mute，加进去会闪空状态。
+   */
+  const watched = sharers.filter(
+    (s) => st(s.participant.identity).video && isLiveTrack(s.publication.videoTrack),
+  );
 
   /**
    * 要显示的摄像头画面：
@@ -300,7 +324,9 @@ export function RoomLayout() {
       const self = p.identity === localParticipant.identity;
       if (!self && !(watch[p.identity]?.cam ?? false)) return;
       const track = p.getTrackPublication(Track.Source.Camera)?.videoTrack;
-      if (track) out.push({ participant: p, track });
+      // 关掉摄像头后 publication 可能还在、track 却已 ended，别把黑框留下
+      if (!track || !isLiveTrack(track)) return;
+      out.push({ participant: p, track });
     });
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -452,21 +478,6 @@ export function RoomLayout() {
           </div>
         )}
 
-        {unwatched.length > 0 && (
-          <div className="pips">
-            {unwatched.map((s) => (
-              <div className="pip" key={s.participant.identity}>
-                <div className="thumb">{nameOf(s.participant)} 的屏幕 · 未接收</div>
-                <div className="piprow">
-                  <span>{nameOf(s.participant)}</span>
-                  <button className="mini primary" onClick={() => receive(s.participant.identity)} type="button">
-                    接收
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
       </main>
 
       <aside className={'people' + (collapsed ? ' collapsed' : '')}>
@@ -614,12 +625,6 @@ export function RoomLayout() {
           align-items:center;justify-content:center;gap:7px;background:rgba(8,11,15,.72);
           border-radius:12px;color:#cfdae6;font-size:13px;pointer-events:none}
         .reconn span{color:#8b97a6;font-size:11px}
-        .pips{position:absolute;left:10px;bottom:10px;display:flex;flex-direction:column;gap:8px;z-index:2}
-        .pip{width:216px;background:#1b222b;border:1px solid #252e39;border-radius:10px;overflow:hidden;
-          box-shadow:0 8px 24px rgba(0,0,0,.5)}
-        .pip .thumb{height:92px;display:flex;align-items:center;justify-content:center;font-size:11px;
-          color:#5d6875;background:repeating-linear-gradient(135deg,#141b24 0 10px,#111821 10px 20px)}
-        .pip .piprow{display:flex;align-items:center;justify-content:space-between;padding:6px 9px;font-size:12px}
         /* 摄像头：没有投屏时铺满主舞台 */
         .camgrid{width:100%;height:100%;display:grid;gap:8px;padding:8px;min-height:0}
         .camgrid.c1{grid-template-columns:1fr;grid-template-rows:1fr}
@@ -685,7 +690,6 @@ export function RoomLayout() {
           .people .pheadd{display:none}
           .people .person{min-width:150px;margin:0}
           .dsh-room.collapsed .people{display:none}
-          .pips{display:none}
           .campip{width:min(42%,170px);right:8px;bottom:8px}
           .cbtn{min-width:46px;padding:6px 4px}
           .cbtn span:last-child{display:none}
@@ -704,7 +708,15 @@ function SharedVideo({ trackRef }: { trackRef: TrackReference }) {
     const el = ref.current;
     if (!el || !track) return;
     track.attach(el);
+    // 轨道 ended 时清空画面，否则 <video> 会定格在最后一帧（黑屏）
+    const mst = track.mediaStreamTrack;
+    const onEnded = () => {
+      track.detach(el);
+      el.srcObject = null;
+    };
+    mst?.addEventListener('ended', onEnded);
     return () => {
+      mst?.removeEventListener('ended', onEnded);
       track.detach(el);
     };
   }, [track]);
@@ -723,7 +735,15 @@ function CamVideo({ track, mirrored }: { track: VideoTrack; mirrored?: boolean }
     const el = ref.current;
     if (!el) return;
     track.attach(el);
+    // 关摄像头后 track 会 ended，不清空就留一块黑
+    const mst = track.mediaStreamTrack;
+    const onEnded = () => {
+      track.detach(el);
+      el.srcObject = null;
+    };
+    mst?.addEventListener('ended', onEnded);
     return () => {
+      mst?.removeEventListener('ended', onEnded);
       track.detach(el);
     };
   }, [track]);
