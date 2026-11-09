@@ -3,6 +3,10 @@
 #
 # 用法：  bash apply-patches.sh <meet 源码目录>
 # 这段逻辑和服务器上的 setup.sh 第 2 步等价，改一边记得改另一边。
+#
+# 2026-11-09 改成**自动发现**：patches/ 里有几个文件就拷几个，
+# 不再手写清单。之前手写清单漏掉新文件（MicGain.ts）导致 CI 必挂，
+# 这种错不该再犯第二次。
 set -euo pipefail
 
 SRC="${1:?用法: apply-patches.sh <meet 源码目录>}"
@@ -13,40 +17,40 @@ ROOM="$SRC/app/rooms/[roomName]"
 [ -d "$SRC/app" ] || { echo "错误：$SRC 不像 meet 源码目录"; exit 1; }
 [ -d "$ROOM" ] || { echo "错误：$ROOM 不存在，上游可能改了文件结构"; exit 1; }
 
-# 注意：MicGain.ts / GainProcessor.ts 是**新增**文件，上游仓库里没有。
-# 漏拷会在 pnpm build 时报 Module not found: Can't resolve './MicGain'。
-ROOM_FILES=(
-  PageClientImpl.tsx page.tsx AudioMixer.tsx ScreenQuality.tsx
-  NoiseControl.tsx DfnProcessor.ts RoomLayout.tsx SettingsPanel.tsx
-  ShareConfig.ts MicIntent.ts MicWatchdog.tsx Chime.ts
-  MicGain.ts GainProcessor.ts
-)
-ROOT_FILES=(Dockerfile route.ts)
+# 只有这两个文件不在房间目录下，其余一律进 app/rooms/[roomName]/
+dest_of() {
+  case "$1" in
+    Dockerfile) echo "$SRC/Dockerfile" ;;
+    route.ts)   echo "$SRC/app/api/connection-details/route.ts" ;;
+    *)          echo "$ROOM/$1" ;;
+  esac
+}
 
 echo "==> 覆盖补丁文件"
-cp -f "$P/Dockerfile" "$SRC/Dockerfile"
-cp -f "$P/route.ts" "$SRC/app/api/connection-details/route.ts"
-for f in "${ROOM_FILES[@]}"; do
-  cp -f "$P/$f" "$ROOM/$f"
+COUNT=0
+for f in "$P"/*; do
+  [ -f "$f" ] || continue
+  base="$(basename "$f")"
+  cp -f "$f" "$(dest_of "$base")"
+  COUNT=$((COUNT + 1))
 done
+echo "    已应用 $COUNT 个文件"
 
 echo "==> 校验补丁完整性"
 MISSING=0
-for f in "${ROOT_FILES[@]}"; do
-  [ -f "$P/$f" ] || { echo "    缺少补丁文件: patches/$f"; MISSING=1; }
-done
-for f in "${ROOM_FILES[@]}"; do
-  if [ ! -f "$P/$f" ]; then
-    echo "    缺少补丁文件: patches/$f"; MISSING=1
-  elif [ ! -f "$ROOM/$f" ]; then
-    echo "    未拷贝到源码: app/rooms/[roomName]/$f"; MISSING=1
+for f in "$P"/*; do
+  [ -f "$f" ] || continue
+  base="$(basename "$f")"
+  dst="$(dest_of "$base")"
+  if [ ! -f "$dst" ]; then
+    echo "    未落地: patches/$base -> $dst"
+    MISSING=1
   fi
 done
 if [ "$MISSING" -ne 0 ]; then
-  echo "错误：补丁不完整，终止构建（别让 CI 跑到 pnpm build 才报错）"
+  echo "错误：补丁不完整，终止构建（别等 pnpm build 才报错）"
   exit 1
 fi
-echo "    已应用 $(( ${#ROOM_FILES[@]} + ${#ROOT_FILES[@]} )) 个文件"
 
 echo "==> 补齐 DeepFilterNet3（wasm + 模型，约 22MB，不进 git）"
 DFN="$SRC/public/dfn"

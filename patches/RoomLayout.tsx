@@ -10,12 +10,30 @@ import {
   useTrackVolume,
 } from '@livekit/components-react';
 import type { TrackReference } from '@livekit/components-react';
-import { Participant, RemoteParticipant, RemoteTrackPublication, RoomEvent, Track, VideoTrack } from 'livekit-client';
+import {
+  ConnectionState,
+  Participant,
+  RemoteParticipant,
+  RemoteTrackPublication,
+  RoomEvent,
+  Track,
+  VideoTrack,
+} from 'livekit-client';
 import { SettingsPanel } from './SettingsPanel';
 import { CAPTURE_FPS, CAPTURE_H, CAPTURE_W, loadHint } from './ShareConfig';
 import { MicWatchdog } from './MicWatchdog';
 import { setMicIntent } from './MicIntent';
 import { playJoinSound } from './Chime';
+import {
+  CHAT_MAX_LEN,
+  ChatMsg,
+  copyToClipboard,
+  hhmm,
+  parseChat,
+  sendChat,
+  splitLinks,
+  toPlainText,
+} from './Chat';
 
 /**
  * 自定义房间布局：投屏当主角，人放右侧紧凑列表。
@@ -188,6 +206,74 @@ export function RoomLayout() {
    * 反而把能自动恢复的连接掐断。所以显式告诉他在重连。
    */
   const [link, setLink] = React.useState<'ok' | 'reconnecting'>('ok');
+
+  /* ---------------- 右侧栏：成员 / 聊天 两个 tab（2026-11-09 加） ---------------- */
+  const [tab, setTab] = React.useState<'people' | 'chat'>('people');
+  const tabRef = React.useRef(tab);
+  tabRef.current = tab;
+  const [msgs, setMsgs] = React.useState<ChatMsg[]>([]);
+  const [unread, setUnread] = React.useState(0);
+  const [draft, setDraft] = React.useState('');
+  const [toast, setToast] = React.useState('');
+  const msgsRef = React.useRef<HTMLDivElement>(null);
+  const composingRef = React.useRef(false);
+  const connected = room.state === ConnectionState.Connected;
+
+  const say = React.useCallback((t: string) => {
+    setToast(t);
+    window.setTimeout(() => setToast(''), 1400);
+  }, []);
+
+  const copy = React.useCallback(
+    async (text: string) => {
+      const ok = await copyToClipboard(text);
+      say(ok ? '已复制' : '复制失败，请手动选中');
+    },
+    [say],
+  );
+
+  /**
+   * 收消息。数据通道**不会回显给发送者**，自己发的那条在 submit 里本地补上。
+   * 消息只存在这个 state 里：退房/刷新组件卸载，聊天记录自然清空（需求就是这么定的）。
+   */
+  React.useEffect(() => {
+    const onData = (payload: Uint8Array, participant?: RemoteParticipant) => {
+      const m = parseChat(payload, participant);
+      if (!m) return;
+      setMsgs((prev) => [...prev.slice(-199), m]);
+      if (tabRef.current !== 'chat') setUnread((n) => n + 1);
+    };
+    room.on(RoomEvent.DataReceived, onData);
+    return () => {
+      room.off(RoomEvent.DataReceived, onData);
+    };
+  }, [room]);
+
+  // 新消息 / 切到聊天 tab 时滚到底
+  React.useEffect(() => {
+    const el = msgsRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [msgs.length, tab]);
+
+  const submit = async () => {
+    const body = draft.trim();
+    if (!body || !connected) return;
+    setDraft('');
+    const msg = await sendChat(room, body).catch((e) => {
+      console.warn('[chat] 发送失败', e);
+      return null;
+    });
+    if (msg) setMsgs((prev) => [...prev.slice(-199), msg]);
+    else say('发送失败');
+  };
+
+  const onChatKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== 'Enter' || e.shiftKey) return;
+    // 中文输入法还在拼音阶段时，回车是选词不是发送，必须挡掉
+    if (composingRef.current || e.nativeEvent.isComposing) return;
+    e.preventDefault();
+    void submit();
+  };
 
   /**
    * 提示音：只在**有人进房**时响一声。
@@ -365,7 +451,7 @@ export function RoomLayout() {
   const stageClass = watched.length >= 2 ? 'stage grid' : 'stage';
 
   return (
-    <div className={'dsh-room' + (collapsed ? ' collapsed' : '')}>
+    <div className={'dsh-room' + (collapsed ? ' collapsed' : '') + (tab === 'chat' ? ' chatopen' : '')}>
       <RoomAudioRenderer />
 
       <header className="top">
@@ -377,7 +463,15 @@ export function RoomLayout() {
         {link !== 'ok' && <span className="chip warn">重连中…</span>}
         <MicWatchdog />
         <span className="spacer" />
-        <button className="mini" onClick={() => setCollapsed((v) => !v)} type="button">
+        <button
+          className="mini"
+          onClick={() => {
+            // 收起后侧栏只剩 64px，聊天面板放不下，先退回成员 tab
+            if (!collapsed && tab === 'chat') setTab('people');
+            setCollapsed((v) => !v);
+          }}
+          type="button"
+        >
           {collapsed ? '展开成员' : '收起成员'}
         </button>
       </header>
@@ -481,26 +575,151 @@ export function RoomLayout() {
       </main>
 
       <aside className={'people' + (collapsed ? ' collapsed' : '')}>
-        <div className="pheadd">
-          <span>成员 · {allParticipants.length}</span>
-          <span className="dim" />
+        <div className="ptabs">
+          <button
+            className={'ptab' + (tab === 'people' ? ' on' : '')}
+            onClick={() => setTab('people')}
+            type="button"
+            title="成员列表"
+          >
+            <span>👥</span>
+            <span className="ptabtxt">成员 {allParticipants.length}</span>
+          </button>
+          <button
+            className={'ptab' + (tab === 'chat' ? ' on' : '')}
+            onClick={() => {
+              setTab('chat');
+              setUnread(0);
+              if (collapsed) setCollapsed(false);
+            }}
+            type="button"
+            title="聊天"
+          >
+            <span>💬</span>
+            <span className="ptabtxt">聊天</span>
+            {unread > 0 && <i className="pdot">{unread > 99 ? '99+' : unread}</i>}
+          </button>
         </div>
-        {allParticipants.map((p) => (
-          <PersonRow
-            key={p.identity}
-            participant={p}
-            self={p.identity === localParticipant.identity}
-            sharing={sharers.some((s) => s.participant.identity === p.identity)}
-            video={st(p.identity).video}
-            audio={st(p.identity).audio}
-            camAvailable={!!p.getTrackPublication(Track.Source.Camera)}
-            cam={st(p.identity).cam}
-            onReceive={() => receive(p.identity)}
-            onStop={() => stopWatch(p.identity)}
-            onToggleAudio={() => toggleAudio(p.identity)}
-            onToggleCam={() => toggleCam(p.identity)}
-          />
-        ))}
+
+        {tab === 'people' ? (
+          <div className="list">
+            {allParticipants.map((p) => (
+              <PersonRow
+                key={p.identity}
+                participant={p}
+                self={p.identity === localParticipant.identity}
+                sharing={sharers.some((s) => s.participant.identity === p.identity)}
+                video={st(p.identity).video}
+                audio={st(p.identity).audio}
+                camAvailable={!!p.getTrackPublication(Track.Source.Camera)}
+                cam={st(p.identity).cam}
+                onReceive={() => receive(p.identity)}
+                onStop={() => stopWatch(p.identity)}
+                onToggleAudio={() => toggleAudio(p.identity)}
+                onToggleCam={() => toggleCam(p.identity)}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="chat">
+            <div className="chatbar">
+              <span className="dim">
+                {msgs.length ? `${msgs.length} 条消息` : '仅本次房间可见'}
+              </span>
+              <button
+                className="mini"
+                onClick={() => {
+                  if (msgs.length) void copy(toPlainText(msgs));
+                }}
+                type="button"
+                disabled={!msgs.length}
+              >
+                复制全部
+              </button>
+            </div>
+
+            <div className="msgs" ref={msgsRef}>
+              {msgs.length === 0 && (
+                <div className="chempty">
+                  还没有消息
+                  <span>离开房间后自动清空</span>
+                </div>
+              )}
+              {msgs.map((m, i) => {
+                const prev = msgs[i - 1];
+                // 同一人连续说话不重复显示名字；间隔超过 5 分钟再显示一次
+                const showHead = !prev || prev.from !== m.from || m.ts - prev.ts > 300000;
+                return (
+                  <div className={'msg' + (m.self ? ' mine' : '')} key={m.id}>
+                    {showHead && (
+                      <div className="mhead">
+                        <span className="mname">{m.name}</span>
+                        <span className="mtime">{hhmm(m.ts)}</span>
+                      </div>
+                    )}
+                    <div className="mbody">
+                      <span className="mtext">
+                        {splitLinks(m.text).map((seg, k) =>
+                          seg.url ? (
+                            <a
+                              key={k}
+                              href={seg.s}
+                              onClick={(e) => {
+                                // 不跳转：Electron 壳没配 openExternal，点了会开一个空白窗
+                                e.preventDefault();
+                                void copy(seg.s);
+                              }}
+                              title="点击复制链接"
+                            >
+                              {seg.s}
+                            </a>
+                          ) : (
+                            <React.Fragment key={k}>{seg.s}</React.Fragment>
+                          ),
+                        )}
+                      </span>
+                      <button
+                        className="mcopy"
+                        onClick={() => void copy(m.text)}
+                        type="button"
+                        title="复制这条"
+                      >
+                        ⧉
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="chron">
+              <textarea
+                className="chatinput"
+                value={draft}
+                maxLength={CHAT_MAX_LEN}
+                rows={1}
+                placeholder={connected ? '回车发送 · Shift+回车换行' : '重连中，暂时发不出去'}
+                disabled={!connected}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={onChatKey}
+                onCompositionStart={() => {
+                  composingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  composingRef.current = false;
+                }}
+              />
+              <button
+                className="mini primary"
+                onClick={() => void submit()}
+                type="button"
+                disabled={!connected || !draft.trim()}
+              >
+                发送
+              </button>
+            </div>
+          </div>
+        )}
       </aside>
 
       <footer className="ctl">
@@ -577,6 +796,8 @@ export function RoomLayout() {
         </button>
       </footer>
 
+      {toast && <div className="toast">{toast}</div>}
+
       <style>{`
         .dsh-room{display:grid;height:100%;grid-template-columns:1fr 264px;
           grid-template-rows:38px 1fr 64px;grid-template-areas:"top top" "stage people" "ctl ctl";
@@ -643,10 +864,17 @@ export function RoomLayout() {
         .campip .camcell{aspect-ratio:4/3;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.5)}
         .campip .camname{font-size:10px;padding:0 5px}
         .people{grid-area:people;background:#151a21;border:1px solid #252e39;border-radius:12px;
-          overflow:auto;padding:8px}
-        .people .pheadd{display:flex;align-items:center;justify-content:space-between;
-          color:#8b97a6;font-size:11px;padding:2px 4px 8px}
+          overflow:hidden;padding:8px;display:flex;flex-direction:column;min-height:0}
         .people .dim{color:#5d6875}
+        /* 右侧栏两个 tab：成员 / 聊天 */
+        .ptabs{display:flex;gap:4px;padding:0 0 6px;flex:none}
+        .ptab{flex:1;display:flex;align-items:center;justify-content:center;gap:4px;
+          background:transparent;border:1px solid transparent;border-radius:8px;
+          color:#8b97a6;font-size:11px;padding:5px 4px;cursor:pointer;position:relative}
+        .ptab.on{background:#1b2734;border-color:#2b3a4b;color:#cfdae6}
+        .pdot{position:absolute;top:-5px;right:0;background:#d9534f;color:#fff;font-size:9px;
+          font-style:normal;border-radius:999px;padding:0 4px;line-height:14px;min-width:14px;text-align:center}
+        .list{flex:1;min-height:0;overflow:auto}
         .person{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:8px;
           margin-bottom:3px;position:relative}
         .person:hover{background:#1a222c}
@@ -670,6 +898,40 @@ export function RoomLayout() {
         .dsh-room.collapsed .people .person{justify-content:center;padding:7px 0}
         .dsh-room.collapsed .people .person::after{content:"";width:20px;height:20px;border-radius:50%;
           background:#22303f;border:1px solid #2c3b4c}
+        .dsh-room.collapsed .ptabs{flex-direction:column;gap:6px}
+        .dsh-room.collapsed .ptabtxt{display:none}
+        /* ---- 聊天面板 ---- */
+        .chat{flex:1;min-height:0;display:flex;flex-direction:column;gap:6px}
+        .chatbar{display:flex;align-items:center;justify-content:space-between;gap:6px;flex:none}
+        .chatbar .mini[disabled]{opacity:.45;cursor:default}
+        .msgs{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:8px;
+          padding-right:2px;user-select:text}
+        .chempty{color:#5d6875;font-size:11px;text-align:center;margin:auto;line-height:1.9}
+        .chempty span{display:block;color:#465059;font-size:10px}
+        .msg{display:flex;flex-direction:column;gap:2px;align-items:flex-start;max-width:100%}
+        .msg.mine{align-items:flex-end}
+        .mhead{display:flex;gap:6px;align-items:baseline;font-size:10px;color:#5d6875;padding:0 2px}
+        .mhead .mname{color:#8b97a6}
+        .mbody{position:relative;display:flex;align-items:flex-start;gap:4px;max-width:100%}
+        .mtext{background:#1b2430;border:1px solid #24303d;border-radius:9px;padding:6px 9px;
+          font-size:12.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word;color:#dbe3ec;
+          max-width:100%}
+        .msg.mine .mtext{background:rgba(47,140,255,.16);border-color:rgba(47,140,255,.35);color:#eaf2ff}
+        .mtext a{color:#6fb1ff;text-decoration:underline;cursor:copy}
+        .mcopy{opacity:0;border:none;background:transparent;color:#7f8b9a;cursor:pointer;
+          font-size:12px;padding:2px 3px;border-radius:5px;flex:none}
+        .mbody:hover .mcopy{opacity:1}
+        .mcopy:hover{background:#222c38;color:#cfdae6}
+        .chron{display:flex;gap:6px;align-items:flex-end;flex:none}
+        .chatinput{flex:1;min-height:32px;max-height:76px;resize:none;background:#0f141a;
+          border:1px solid #263140;border-radius:9px;color:#dbe3ec;font-size:12.5px;
+          line-height:1.5;padding:6px 8px;font-family:inherit}
+        .chatinput:focus{outline:none;border-color:#2f8cff}
+        .chatinput:disabled{opacity:.5}
+        .toast{position:fixed;left:50%;bottom:92px;transform:translateX(-50%);z-index:20;
+          background:rgba(20,28,36,.96);border:1px solid #2c3b4c;color:#cfdae6;
+          font-size:12px;padding:7px 14px;border-radius:999px;pointer-events:none;
+          box-shadow:0 8px 24px rgba(0,0,0,.5)}
         .ctl{grid-area:ctl;display:flex;align-items:center;gap:8px;overflow-x:auto;overflow-y:hidden;
           background:#151a21;border:1px solid #252e39;border-radius:12px;padding:0 12px}
         .ctl .spacer{flex:1}
@@ -686,8 +948,14 @@ export function RoomLayout() {
           .dsh-room{grid-template-columns:1fr;grid-template-rows:34px 1fr 56px 60px;
             grid-template-areas:"top" "stage" "people" "ctl"}
           .dsh-room.collapsed{grid-template-rows:34px 1fr 0 60px}
-          .people{display:flex;align-items:center;gap:6px;overflow-x:auto;padding:6px 8px}
+          .people{display:flex;flex-direction:row;align-items:center;gap:6px;overflow-x:auto;
+            padding:6px 8px}
           .people .pheadd{display:none}
+          .ptabs{flex:none;padding:0 4px 0 0}
+          /* 手机上聊天面板铺在舞台上方，不跟成员挤一行 */
+          .dsh-room.chatopen .people{position:fixed;left:6px;right:6px;top:42px;bottom:124px;z-index:30;
+            flex-direction:column;align-items:stretch;overflow:hidden;padding:8px;
+            box-shadow:0 12px 36px rgba(0,0,0,.65)}
           .people .person{min-width:150px;margin:0}
           .dsh-room.collapsed .people{display:none}
           .campip{width:min(42%,170px);right:8px;bottom:8px}
