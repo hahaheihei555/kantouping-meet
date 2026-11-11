@@ -17,6 +17,12 @@ import { getMicGain, onMicGainChange } from './MicGain';
  * 3. `pauseGateLookaheadFrames: 1` —— 停顿门的前瞻从 3 帧降到 1 帧，
  *    总延迟从 71ms 降到约 51ms（模型 30ms + 重采样 10.7ms + 前瞻 10ms）。
  * 4. `bypassUntilReady: true` —— 模型加载期间声音直通，不会“开麦后先哑几秒”。
+ * 5. **`postGain: true`（2026-11-11）** —— 打开包内置的电平归一器：目标 -23dBFS，
+ *    小声最多 +15dB、大声最多 -10dB，只在说话帧上动（约 5dB/秒），带 0.9 峰值上限防削波。
+ *    客户端已把浏览器 `autoGainControl` 关掉：那个跑在降噪**之前**，会把底噪一起抬起来，
+ *    而且调得太快会「突然变大」。归一放到降噪之后，五个人的音量才会齐。
+ * 6. **不要给未就绪窗口加固定衰减**。postGain 的增益是从 0dB 起步慢慢爬的，
+ *    就绪那一刻电平本来就是连续的；再加一个固定 trim 反而会造出一次跳变。
  */
 
 type DfnWorkletHandle = {
@@ -101,6 +107,11 @@ export class DfnProcessor implements TrackProcessor<Track.Kind.Audio, AudioProce
       pauseGateLookaheadFrames: this.opts.pauseGateLookaheadFrames,
       minSpeechFrames: 1,
       bypassUntilReady: true,
+      // 【2026-11-11】打开电平归一：把每个人的说话音量拉到 -23 dBFS 附近
+      // （小声最多 +15dB、大声最多 -10dB，只在说话帧上动，约 5dB/秒）。
+      // 客户端已关掉浏览器 autoGainControl，就是让它在降噪之后干这活——
+      // 否则五个人的麦灵敏度和距离差异会原样送到耳朵里。
+      postGain: true,
     });
 
     this.src = ctx.createMediaStreamSource(new MediaStream([opts.track]));

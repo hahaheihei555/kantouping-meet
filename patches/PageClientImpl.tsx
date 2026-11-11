@@ -203,12 +203,14 @@ function VideoConferenceComponent(props: {
       publishDefaults: publishDefaults,
       audioCaptureDefaults: {
         deviceId: props.userChoices.audioDeviceId ?? undefined,
-        // 回声消除 / 自动增益保留，**噪声抑制关掉**：
-        // 现在由 DeepFilterNet3（见 <NoiseControl />）在浏览器里做更强的降噪，
-        // 两层叠加反而会让语音发闷、且多花一份 CPU。
+        // 回声消除保留；**噪声抑制和自动增益都关掉**：
+        // - 噪声抑制：由 DeepFilterNet3 做更强的降噪（见 <NoiseControl />），两层叠加会让语音发闷
+        // - 自动增益（2026-11-11 关）：浏览器 AGC 跑在降噪**之前**，会把底噪跟着人声一起抬起来，
+        //   而且调节速度太快，开口瞬间会「突然变大」。
+        //   电平归一改由 DeepFilterNet3 内置的 PostGain 负责（在降噪之后，只在说话帧上动，5dB/秒）。
         echoCancellation: true,
         noiseSuppression: false,
-        autoGainControl: true,
+        autoGainControl: false,
       },
       // 【刻意关掉】adaptiveStream 会按「元素尺寸 + 带宽估计」自动给每个观众选 simulcast 层，
       // 结果就是网络稍抖就被塞到 360p，投屏文字糊成一片。
