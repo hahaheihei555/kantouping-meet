@@ -19,6 +19,7 @@ import {
 } from 'livekit-client';
 import { useRouter } from 'next/navigation';
 import { RoomLayout } from './RoomLayout';
+import { warmupDfn } from './DfnProcessor';
 import { AUTO_BASE, CAPTURE_FPS } from './ShareConfig';
 import { useSetupE2EE } from '@/lib/useSetupE2EE';
 import { useLowCPUOptimizer } from '@/lib/usePerfomanceOptimiser';
@@ -68,6 +69,16 @@ export function PageClientImpl(props: {
       new Room().prepareConnection(props.serverUrl);
     }
   }, [props.serverUrl]);
+
+  /**
+   * 预热降噪模型（2026-11-12）。
+   * 用户还停在 PreJoin 页填名字/试麦的时候，就把 22MB 模型下载 + wasm 编译做完，
+   * 等真正开麦时 DfnProcessor 只剩建节点，不会出现「刚进房几秒原始噪音」的窗口。
+   * 桌面壳带 ?autojoin=1 直接进房时这一步会和其他初始化并行，也不亏。
+   */
+  React.useEffect(() => {
+    void warmupDfn();
+  }, []);
 
   const handlePreJoinSubmit = React.useCallback(async (values: LocalUserChoices) => {
     try {
