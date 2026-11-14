@@ -5,6 +5,7 @@ import { useRoomContext, useTrackVolume, useTracks } from '@livekit/components-r
 import type { TrackReference } from '@livekit/components-react';
 import { RemoteAudioTrack, Track } from 'livekit-client';
 import { getMicGain, setMicGain } from './MicGain';
+import { MIC_KEY, deviceExists, forgetSavedMic } from './MicDevice';
 
 /**
  * 音量面板。
@@ -148,6 +149,66 @@ export function AudioMixer() {
   const [master, setMaster] = React.useState(100);
   const [myGain, setMyGain] = React.useState(100);
 
+  /* ---------------- 输入设备（麦克风）选择，2026-11-13 ---------------- */
+  const [inputs, setInputs] = React.useState<MediaDeviceInfo[]>([]);
+  const [micId, setMicId] = React.useState('');
+  const [micErr, setMicErr] = React.useState('');
+
+  /** 枚举输入设备；没拿到权限时 label 是空的，用"麦克风 N"占位 */
+  const refreshInputs = React.useCallback(async () => {
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      setInputs(all.filter((d) => d.kind === 'audioinput'));
+    } catch {
+      /* 浏览器不支持 / 权限被拒 */
+    }
+  }, []);
+
+  React.useEffect(() => {
+    // 记住的设备要是不在了（耳机拔了/换了电脑），顺手清掉，
+    // 否则下次进房还会拿它去开麦（见 MicDevice.ts）
+    void (async () => {
+      const saved = window.localStorage.getItem(MIC_KEY) ?? '';
+      if (saved && !(await deviceExists('audioinput', saved))) forgetSavedMic();
+    })();
+    void refreshInputs();
+    // 插拔 USB 麦克风/耳机时列表要跟着变
+    const onChange = () => void refreshInputs();
+    navigator.mediaDevices?.addEventListener('devicechange', onChange);
+    return () => navigator.mediaDevices?.removeEventListener('devicechange', onChange);
+  }, [refreshInputs]);
+
+  // 初始值：优先读当前麦克风轨道的真实 deviceId，其次读记住的选择
+  React.useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(MIC_KEY) ?? '';
+      const t = room.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
+      const now = t?.mediaStreamTrack.getSettings().deviceId;
+      setMicId(now || saved);
+    } catch {
+      /* 忽略 */
+    }
+  }, [room]);
+
+  const switchMic = async (deviceId: string) => {
+    setMicErr('');
+    setMicId(deviceId);
+    try {
+      window.localStorage.setItem(MIC_KEY, deviceId);
+    } catch {
+      /* 忽略 */
+    }
+    try {
+      // 选「系统默认」时 deviceId 是空串，这时不能要求 exact（会报错）；
+      // 指定具体设备时用 exact=true：设备拔掉了就报错，别静默切回默认设备
+      await room.switchActiveDevice('audioinput', deviceId, !!deviceId);
+    } catch (e) {
+      setMicErr('切换失败，可能设备已被拔掉');
+      console.warn('[mic] 切换输入设备失败', e);
+      void refreshInputs();
+    }
+  };
+
   React.useEffect(() => {
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -219,6 +280,33 @@ export function AudioMixer() {
   return (
     <div style={{ color: '#e6e6e6', fontSize: 12 }}>
       <div style={{ marginBottom: 8, color: '#cfd6e1', fontWeight: 600 }}>音量</div>
+
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ color: '#a9b3c1', marginBottom: 4 }}>
+          🎙 输入设备
+          {micErr && <span style={{ color: '#e06c6c', marginLeft: 8 }}>{micErr}</span>}
+        </div>
+        <select
+          value={micId}
+          onChange={(e) => void switchMic(e.target.value)}
+          style={{
+            width: '100%',
+            background: '#0f141a',
+            border: '1px solid #263140',
+            borderRadius: 8,
+            color: '#dbe3ec',
+            fontSize: 12,
+            padding: '6px 8px',
+          }}
+        >
+          <option value="">系统默认</option>
+          {inputs.map((d, i) => (
+            <option key={d.deviceId || i} value={d.deviceId}>
+              {d.label || `麦克风 ${i + 1}`}
+            </option>
+          ))}
+        </select>
+      </div>
 
       <SimpleRow icon="🔊" label="总音量" value={master} onChange={changeMaster} />
       <SimpleRow icon="🎙" label="我的麦克风" value={myGain} onChange={changeMyGain} />

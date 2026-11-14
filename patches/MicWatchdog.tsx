@@ -4,6 +4,7 @@ import * as React from 'react';
 import { useRoomContext } from '@livekit/components-react';
 import { Track } from 'livekit-client';
 import { getMicIntent } from './MicIntent';
+import { enableMicSafely } from './MicDevice';
 
 /**
  * 麦克风看门狗（2026-11-07）。
@@ -55,7 +56,8 @@ export function MicWatchdog() {
       attempts.current += 1;
       console.warn(`[mic-watchdog] 麦克风未在发布，尝试重新打开（第 ${attempts.current} 次）`);
 
-      lp.setMicrophoneEnabled(true)
+      // 走安全版本：保存的设备不在了会自动退回系统默认，否则每 3 秒失败一次
+      enableMicSafely(room, lp)
         .then(() => {
           attempts.current = 0;
           setRecovered(true);

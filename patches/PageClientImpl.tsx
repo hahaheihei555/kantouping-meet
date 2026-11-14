@@ -20,6 +20,7 @@ import {
 import { useRouter } from 'next/navigation';
 import { RoomLayout } from './RoomLayout';
 import { warmupDfn } from './DfnProcessor';
+import { MIC_KEY, deviceExists, enableMicSafely, forgetSavedMic } from './MicDevice';
 import { AUTO_BASE, CAPTURE_FPS } from './ShareConfig';
 import { useSetupE2EE } from '@/lib/useSetupE2EE';
 import { useLowCPUOptimizer } from '@/lib/usePerfomanceOptimiser';
@@ -43,9 +44,12 @@ export function PageClientImpl(props: {
     // 目的：双击图标 → 直接进房，而不是每次都停在 PreJoin 页输名字。
     let saved = '';
     let urlName = '';
+    let micId = '';
     try {
       saved = window.localStorage.getItem('dsh-name') ?? '';
       urlName = new URLSearchParams(window.location.search).get('name') ?? '';
+      // 上次在「设置 → 音量」里选的输入设备，PreJoin 预选它（2026-11-13）
+      micId = window.localStorage.getItem(MIC_KEY) ?? '';
     } catch {
       /* SSR / 隐私模式 */
     }
@@ -56,6 +60,7 @@ export function PageClientImpl(props: {
       // 想露脸的人进房后点工具栏的摄像头按钮随时开，不影响任何功能。
       videoEnabled: false,
       audioEnabled: true,
+      audioDeviceId: micId || undefined,
     };
   }, []);
   const [connectionDetails, setConnectionDetails] = React.useState<ConnectionDetails | undefined>(
@@ -86,7 +91,18 @@ export function PageClientImpl(props: {
     } catch {
       /* 隐私模式 */
     }
-    setPreJoinChoices(values);
+    /**
+     * 设备可能已经不在了（蓝牙耳机没连、USB 麦拔了、换了电脑）。
+     * 这时绝不能把失效的 deviceId 传下去 —— 否则开麦抛 NotFoundError，
+     * 整个房间弹「Requested device not found」，人直接进不来（2026-11-13 老冰棍）。
+     */
+    let safeValues = values;
+    if (!(await deviceExists('audioinput', values.audioDeviceId))) {
+      console.warn('[mic] 选中的输入设备不在了，改用系统默认');
+      forgetSavedMic();
+      safeValues = { ...values, audioDeviceId: '' };
+    }
+    setPreJoinChoices(safeValues);
     const url = new URL(CONN_DETAILS_ENDPOINT, window.location.origin);
     url.searchParams.append('roomName', props.roomName);
     url.searchParams.append('participantName', values.username);
@@ -260,6 +276,13 @@ function VideoConferenceComponent(props: {
   const connectOptions = React.useMemo((): RoomConnectOptions => {
     const opts: RoomConnectOptions = {
       autoSubscribe: true,
+      /**
+       * 【2026-11-14】偶发连不上（校园网/家庭宽带打洞失败、链路抖动）时自动重试。
+       * 之前是失败一次就弹错/停在重连遮罩，人只能手点重进。
+       * maxRetries: 3 让 SDK 自己再试 3 次，多数瞬时抖动能在这一步消化掉。
+       */
+      maxRetries: 3,
+      peerConnectionTimeout: 20000,
     };
     // 【实验开关，仅排查用】?relay=1 强制媒体走 TURN 中继。
     // 用途：判断校园网是不是只对 UDP 媒体主端口（7882）限速/丢包 ——
@@ -294,7 +317,8 @@ function VideoConferenceComponent(props: {
         });
       }
       if (props.userChoices.audioEnabled) {
-        room.localParticipant.setMicrophoneEnabled(true).catch((error) => {
+        // 设备不在了会自动退回系统默认设备，而不是把整个房间搞出错误框
+        enableMicSafely(room, room.localParticipant).catch((error) => {
           handleError(error);
         });
       }

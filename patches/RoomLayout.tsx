@@ -23,6 +23,7 @@ import { SettingsPanel } from './SettingsPanel';
 import { CAPTURE_FPS, CAPTURE_H, CAPTURE_W, loadHint } from './ShareConfig';
 import { MicWatchdog } from './MicWatchdog';
 import { setMicIntent } from './MicIntent';
+import { enableMicSafely } from './MicDevice';
 import { playJoinSound } from './Chime';
 import {
   CHAT_MAX_LEN,
@@ -729,7 +730,11 @@ export function RoomLayout() {
             const next = !isMicrophoneEnabled;
             // 记住「用户想要的状态」，<MicWatchdog> 靠它判断该不该自动救回
             setMicIntent(next);
-            localParticipant.setMicrophoneEnabled(next).catch((e) => {
+            // 开麦走安全版本：记住的设备不在了会自动退回系统默认
+            const p = next
+              ? enableMicSafely(room, localParticipant)
+              : localParticipant.setMicrophoneEnabled(false);
+            p.catch((e) => {
               console.warn('[mic] 切换失败', e);
             });
           }}
